@@ -54,9 +54,10 @@ TROUBLESHOOTING
   "no names showing up": make sure you're on a Google or Bing *results*
     page - not the homepage, and not LinkedIn itself. Only result pages from
     those two engines are harvested.
-  Names look wrong (titles, extra words): the parser keeps the first and
-    last token of the name chunk; eyeball the output (or the --csv) and
-    prune before generating emails. Re-run with -v to see source titles.
+  Names look wrong (titles, extra words): the parser keeps the whole name
+    chunk (before the first " - " and before any comma), so odd listings can
+    still carry extra words; eyeball the output (or the --csv) and prune
+    before generating emails. Re-run with -v to see source titles.
 ------------------------------------------------------------------------
 """
 from __future__ import annotations
@@ -83,11 +84,11 @@ except ImportError:
     _PARSER = "html.parser"
 
 
-# Trailing site markers to strip from result titles, various locales/dashes.
-TITLE_TAIL = re.compile(r"\s*[\|\-–—]\s*LinkedIn.*$", re.IGNORECASE)
-NAME_SPLIT = re.compile(r"\s+[\-–—\|]\s+")      # " - ", " – ", " | "
+# Splitting a result title into a name (see _name_chunk).
+NAME_SPLIT = re.compile(r"\s+[\-–—|]\s+")       # " - ", " – ", " | "
 VIEW_PREFIX = re.compile(r"^view\s+", re.IGNORECASE)
 POSSESSIVE = re.compile(r"[’']s\s+profile.*$", re.IGNORECASE)
+BRACKETS = re.compile(r"[\(\[][^)\]]*[\)\]]")   # "(He/Him)", "[Open to work]"
 
 
 class Harvester:
@@ -101,7 +102,7 @@ class Harvester:
         self.user_data_dir = user_data_dir
         # name -> title (first title seen)
         self.found: dict[str, str] = {}
-        # name -> full uncollapsed name chunk (for manual CSV cleanup)
+        # name -> name again (kept so the CSV writer has a per-name value)
         self.chunks: dict[str, str] = {}
         self._driver = None
 
@@ -233,30 +234,40 @@ class Harvester:
     # -- title -> name -----------------------------------------------------
     def _handle_title(self, title: str, known_linkedin: bool = False) -> None:
         title = unescape(title).strip()
-        if not known_linkedin and "linkedin" not in title.lower():
+        low = title.lower()
+        if not known_linkedin and "linkedin" not in low:
             return
-        if self.safe and self.company not in title.lower():
+        if self.safe and self.company not in low:
             return
-        name_part = self._name_chunk(title)
-        tokens = name_part.split()
-        if len(tokens) < 2:
+        name = self._name_chunk(title)
+        if len(name.split()) < 2:   # need at least a first and a last name
             return
-        name = f"{tokens[0]} {tokens[-1]}"
         if name not in self.found:
             self.found[name] = title
-            self.chunks[name] = name_part
+            self.chunks[name] = name
 
     @staticmethod
     def _name_chunk(title: str) -> str:
-        """The name portion of a result title, before the job-title separator,
-        with site markers and 'View ... profile' wrappers stripped. NOT
-        collapsed to first+last, so 'Snezana Bakalovski MAICD - Chief People
-        Officer' -> 'Snezana Bakalovski MAICD'."""
-        clean = TITLE_TAIL.sub("", title).strip()
-        clean = VIEW_PREFIX.sub("", clean)
-        clean = POSSESSIVE.sub("", clean)
-        name_part = NAME_SPLIT.split(clean)[0].strip()
-        return re.sub(r"[^A-Za-zÀ-ɏ '\-]", "", name_part).strip()
+        """Reduce a result title to a person's full name, the way
+        GatherContacts does: cut the '| LinkedIn' suffix, take the part before
+        the first ' - ' job-title separator, drop post-nominals after a comma,
+        and KEEP THE WHOLE NAME (first, any middle names, last) rather than
+        collapsing to first+last.
+
+            'Mary Jane Watson - UX Designer, MBA | LinkedIn' -> 'Mary Jane Watson'
+            'John Smith, CPA - Finance at Acme'              -> 'John Smith'
+        """
+        s = title.split("|", 1)[0]          # drop "| LinkedIn" and anything after
+        s = NAME_SPLIT.split(s)[0]          # name is before the first " - "/" – "
+        s = s.split(",", 1)[0]              # drop ", CPA" / ", PhD" credentials
+        s = VIEW_PREFIX.sub("", s.strip())  # "View <name>'s profile" wrappers
+        s = POSSESSIVE.sub("", s)
+        s = BRACKETS.sub(" ", s)            # "(He/Him)", "[Open to work]", etc.
+        # Keep letters of any script, spaces, apostrophes and hyphens; turn the
+        # rest (emoji, digits, symbols) into spaces. Unicode-aware via isalpha,
+        # so non-Latin names survive - the old Latin-only filter dropped them.
+        s = "".join(c if (c.isalpha() or c in " '-") else " " for c in s)
+        return " ".join(s.split())          # collapse whitespace and trim
 
     # -- per-engine harvesting --------------------------------------------
     def _harvest_bing(self, soup: BeautifulSoup) -> None:
@@ -379,8 +390,8 @@ def write_results(h: Harvester, args) -> None:
             w = csv.writer(fh)
             for n in names:
                 w.writerow([h.chunks.get(n, n)])
-        print(f"[+] {len(names)} rows -> {cfile}  (no header; one full name "
-              "chunk per row - clean it up by hand)")
+        print(f"[+] {len(names)} rows -> {cfile}  (no header; one name per "
+              "row - clean it up by hand)")
 
     if args.format:
         emails, seen = [], set()
@@ -410,9 +421,9 @@ def main() -> None:
                     help="output file (default: names.txt)")
     ap.add_argument("--csv", nargs="?", const="<auto>", default=None,
                     metavar="PATH",
-                    help="also write a header-less CSV of one full name per "
-                         "row (uncollapsed, for manual cleanup); bare --csv "
-                         "writes <output basename>.csv")
+                    help="also write a header-less CSV of one name per row "
+                         "(for manual cleanup); bare --csv writes "
+                         "<output basename>.csv")
     ap.add_argument("-s", "--safe", action="store_true",
                     help="only keep titles containing the company name")
     ap.add_argument("--user-data-dir",

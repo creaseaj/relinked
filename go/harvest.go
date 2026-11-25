@@ -11,18 +11,18 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"unicode"
 
 	"github.com/PuerkitoBio/goquery"
 )
 
-// Trailing site markers / wrappers to peel off a result title, mirroring the
-// Python version's regexes (various locales and dash characters).
+// Splitting a result title into a name (see nameChunk), mirroring the Python
+// version's regexes.
 var (
-	titleTail  = regexp.MustCompile(`(?i)\s*[\|\-–—]\s*LinkedIn.*$`)
-	nameSplit  = regexp.MustCompile(`\s+[\-–—\|]\s+`) // " - ", " – ", " | "
+	nameSplit  = regexp.MustCompile(`\s+[\-–—|]\s+`) // " - ", " – ", " | "
 	viewPrefix = regexp.MustCompile(`(?i)^view\s+`)
 	possessive = regexp.MustCompile(`(?i)[’']s\s+profile.*$`)
-	keepStrip  = regexp.MustCompile(`[^A-Za-zÀ-ɏ '\-]`) // drop anything else
+	brackets   = regexp.MustCompile(`[\(\[][^)\]]*[\)\]]`) // "(He/Him)", "[Open to work]"
 	nonAlpha   = regexp.MustCompile(`[^a-z]`)
 )
 
@@ -110,29 +110,42 @@ func (h *Harvester) handleTitle(title string, knownLinkedIn bool) {
 	if h.safe && !strings.Contains(low, h.company) {
 		return
 	}
-	namePart := nameChunk(title)
-	tokens := strings.Fields(namePart)
-	if len(tokens) < 2 {
+	name := nameChunk(title)
+	if len(strings.Fields(name)) < 2 { // need at least a first and a last name
 		return
 	}
-	name := tokens[0] + " " + tokens[len(tokens)-1]
 	if _, seen := h.found[name]; !seen {
 		h.found[name] = title
-		h.chunks[name] = namePart
+		h.chunks[name] = name
 	}
 }
 
-// nameChunk returns the name portion of a result title, before the job-title
-// separator, with site markers and "View ... profile" wrappers stripped. It
-// is NOT collapsed to first+last, so "Snezana Bakalovski MAICD - Chief People
-// Officer" -> "Snezana Bakalovski MAICD".
+// nameChunk reduces a result title to a person's full name, the way
+// GatherContacts does: cut the "| LinkedIn" suffix, take the part before the
+// first " - " job-title separator, drop post-nominals after a comma, and KEEP
+// THE WHOLE NAME (first, any middle names, last) rather than collapsing to
+// first+last.
+//
+//	"Mary Jane Watson - UX Designer, MBA | LinkedIn" -> "Mary Jane Watson"
+//	"John Smith, CPA - Finance at Acme"              -> "John Smith"
 func nameChunk(title string) string {
-	clean := strings.TrimSpace(titleTail.ReplaceAllString(title, ""))
-	clean = viewPrefix.ReplaceAllString(clean, "")
-	clean = possessive.ReplaceAllString(clean, "")
-	part := nameSplit.Split(clean, -1)[0]
-	part = keepStrip.ReplaceAllString(part, "")
-	return strings.TrimSpace(part)
+	s := strings.SplitN(title, "|", 2)[0]  // drop "| LinkedIn" and anything after
+	s = nameSplit.Split(s, -1)[0]           // name is before the first " - "/" – "
+	s = strings.SplitN(s, ",", 2)[0]        // drop ", CPA" / ", PhD" credentials
+	s = strings.TrimSpace(s)
+	s = viewPrefix.ReplaceAllString(s, "")  // "View <name>'s profile" wrappers
+	s = possessive.ReplaceAllString(s, "")
+	s = brackets.ReplaceAllString(s, " ")   // "(He/Him)", "[Open to work]", etc.
+	// Keep letters of any script, spaces, apostrophes and hyphens; turn the
+	// rest (emoji, digits, symbols) into spaces. Unicode-aware, so non-Latin
+	// names survive - the old Latin-only filter dropped them.
+	s = strings.Map(func(r rune) rune {
+		if unicode.IsLetter(r) || r == ' ' || r == '\'' || r == '-' {
+			return r
+		}
+		return ' '
+	}, s)
+	return strings.Join(strings.Fields(s), " ") // collapse whitespace and trim
 }
 
 // -- per-engine harvesting -------------------------------------------------

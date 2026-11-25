@@ -59,9 +59,19 @@ func TestSafeMode(t *testing.T) {
 
 func TestNameChunk(t *testing.T) {
 	cases := map[string]string{
+		// Keep the WHOLE name, including middle names and post-nominals that
+		// sit before a comma.
 		"Snezana Bakalovski MAICD - Chief People Officer":   "Snezana Bakalovski MAICD",
+		"Mary Jane Watson - UX Designer, MBA | LinkedIn":    "Mary Jane Watson",
 		"Jane Smith - Head of Marketing at Acme | LinkedIn": "Jane Smith",
-		"View Bob Jones’s profile":                          "Bob Jones",
+		// Comma drops credentials (regression: used to become "John CPA").
+		"John Smith, CPA - Finance at Acme": "John Smith",
+		// Wrappers, brackets, en-dash, and non-Latin scripts.
+		"View Bob Jones’s profile":      "Bob Jones",
+		"Jane Doe (She/Her) - Designer": "Jane Doe",
+		"Ana García Pérez – Ingeniera":  "Ana García Pérez", // en-dash separator
+		"John Doe | LinkedIn":           "John Doe",
+		"Пётр Иванов - Инженер":          "Пётр Иванов",       // Cyrillic survives
 	}
 	for in, want := range cases {
 		if got := nameChunk(in); got != want {

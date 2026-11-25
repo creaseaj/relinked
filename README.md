@@ -97,16 +97,20 @@ python3 relinked.py -t "Target Company" -f '{first}.{last}@target.com' --csv
 
 ## Output
 
-- `names.txt` — one `First Last` per line, de-duplicated and sorted.
-- `--csv` → a header-less CSV with the full, uncollapsed name chunk per row
-  (middle names / post-nominals intact) for hand-cleanup before generating
-  emails.
+- `names.txt` — one full name per line (first, any middle names, last),
+  de-duplicated and sorted.
+- `--csv` → a header-less CSV with one name per row for hand-cleanup before
+  generating emails.
 - `-f/--format` → `<output>_emails.txt`, applying a `{first}`/`{last}`/`{f}`/`{l}`
-  template.
+  template (built from the first and last word of each name).
 
-Names come from result titles, so eyeball them before use — some listings bury
-the name behind job titles or "View X's profile"; the parser keeps the first
-and last token of the name chunk.
+Name parsing follows the approach of
+[GatherContacts](https://github.com/clr2of8/GatherContacts): from a result
+title it cuts the `| LinkedIn` suffix, takes the part before the first ` - `
+(the job title), drops anything after a comma (credentials like `CPA`, `PhD`),
+and keeps the **whole** name. Names come from result titles, so odd listings
+can still carry extra words — eyeball the output before use, and re-run with
+`-v`/`--verbose` to see each name next to the title it came from.
 
 ## Developing
 
