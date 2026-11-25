@@ -27,6 +27,20 @@ you want to run it.
 Both need a Chrome/Chromium on the machine and a display (the window is visible
 on purpose — you drive it).
 
+### Running on Kali
+
+The Go binary is statically linked, so it drops onto Kali and runs with nothing
+else installed — but it still drives a browser, so note:
+
+- **Install Chromium.** Kali ships Firefox ESR by default, and this tool can
+  only drive Chrome/Chromium: `sudo apt install chromium`. (Or point
+  `--chrome` at any Chrome/Chromium binary you have.)
+- **Use a desktop session.** The window is visible and you drive it, so a GUI
+  Kali is required — a headless/SSH/WSL Kali has no display and won't work.
+- **Root is handled.** Chrome won't run as root without `--no-sandbox`; relinked
+  adds it automatically when it detects it's running as root (common on Kali).
+  Pass `--no-sandbox` yourself to force it otherwise.
+
 ## Go binary
 
 ```sh

@@ -61,6 +61,7 @@ type config struct {
 	safe        bool
 	userDataDir string
 	chromePath  string
+	noSandbox   bool
 	interval    time.Duration
 	verbose     bool
 }
@@ -95,6 +96,7 @@ func parseFlags() config {
 	boolf(&c.csv, "also write a header-less CSV of one full name per row (<output>.csv)", "csv", "")
 	boolf(&c.safe, "only keep titles containing the company name", "s", "safe")
 	boolf(&c.verbose, "print captured names with their source titles", "v", "verbose")
+	boolf(&c.noSandbox, "launch Chrome with --no-sandbox (auto-enabled when running as root, e.g. root Kali)", "no-sandbox", "")
 	flag.Float64Var(&intervalSec, "interval", 1.0,
 		"seconds between page checks while watching (a tiny DOM read; sends no requests)")
 
@@ -152,6 +154,19 @@ func startBrowser(c config) (context.Context, context.CancelFunc) {
 	if c.chromePath != "" {
 		opts = append(opts, chromedp.ExecPath(c.chromePath))
 	}
+	// Chrome refuses to run as root unless sandboxing is disabled. Kali is
+	// frequently used as root, so auto-add --no-sandbox there (and --disable-
+	// dev-shm-usage, which also avoids crashes in containers / WSL with a tiny
+	// /dev/shm). os.Geteuid returns -1 on non-Unix, so this never fires there.
+	if c.noSandbox || os.Geteuid() == 0 {
+		if os.Geteuid() == 0 && !c.noSandbox {
+			fmt.Println("[i] running as root - launching Chrome with --no-sandbox")
+		}
+		opts = append(opts,
+			chromedp.Flag("no-sandbox", true),
+			chromedp.Flag("disable-dev-shm-usage", true),
+		)
+	}
 
 	allocCtx, cancelAlloc := chromedp.NewExecAllocator(context.Background(), opts...)
 	ctx, cancelCtx := chromedp.NewContext(allocCtx)
@@ -170,7 +185,9 @@ func startBrowser(c config) (context.Context, context.CancelFunc) {
 		cancelCtx()
 		cancelAlloc()
 		fmt.Fprintf(os.Stderr, "[-] couldn't launch Chrome: %v\n"+
-			"    Make sure Chrome/Chromium is installed, or pass --chrome <path>.\n", err)
+			"    Make sure a Chrome/Chromium is installed and on a machine with a\n"+
+			"    display. On Kali it isn't installed by default: sudo apt install chromium\n"+
+			"    (Firefox won't work - this needs Chrome/Chromium). Or pass --chrome <path>.\n", err)
 		os.Exit(1)
 	}
 	return ctx, func() { cancelCtx(); cancelAlloc() }
