@@ -113,6 +113,8 @@ class Scraper:
             self.session.proxies.update({"http": proxy, "https": proxy})
         # name -> title (first title seen)
         self.found: dict[str, str] = {}
+        # name -> full uncollapsed name chunk (for manual CSV cleanup)
+        self.chunks: dict[str, str] = {}
         self._driver = None  # lazily created selenium driver
 
     def _get(self, url: str) -> str | None:
@@ -149,17 +151,29 @@ class Scraper:
             return
         if self.safe and self.company not in title.lower():
             return
+        name_part = self._name_chunk(title)
+        tokens = name_part.split()
+        if len(tokens) < 2:
+            return
+        name = f"{tokens[0]} {tokens[-1]}"
+        if name not in self.found:
+            self.found[name] = title
+            # Keep the full, uncollapsed name chunk (middle names, post-nominals
+            # and all) for manual cleanup in the CSV.
+            self.chunks[name] = name_part
+
+    @staticmethod
+    def _name_chunk(title: str) -> str:
+        """The name portion of a result title, before the job-title separator,
+        with site markers and 'View ... profile' wrappers stripped. Unlike the
+        stored name it is NOT collapsed to first+last, so e.g.
+        'Snezana Bakalovski MAICD - Chief People Officer' -> 'Snezana Bakalovski MAICD'."""
         clean = TITLE_TAIL.sub("", title).strip()
         clean = VIEW_PREFIX.sub("", clean)
         clean = POSSESSIVE.sub("", clean)
         name_part = NAME_SPLIT.split(clean)[0].strip()
         # keep letters, spaces, hyphens, apostrophes only
-        name_part = re.sub(r"[^A-Za-zÀ-ɏ '\-]", "", name_part).strip()
-        tokens = name_part.split()
-        if len(tokens) < 2:
-            return
-        name = f"{tokens[0]} {tokens[-1]}"
-        self.found.setdefault(name, title)
+        return re.sub(r"[^A-Za-zÀ-ɏ '\-]", "", name_part).strip()
 
     # -- engines -----------------------------------------------------------
     def duckduckgo(self, depth: int) -> None:
@@ -375,8 +389,8 @@ def main() -> None:
                     help="output file (default: names.txt)")
     ap.add_argument("--csv", nargs="?", const="<auto>", default=None,
                     metavar="PATH",
-                    help="also write a CSV (first,last,name,source_title[,email]) "
-                         "for manual review/fixing; bare --csv writes "
+                    help="also write a header-less CSV of one full name per row "
+                         "(uncollapsed, for manual cleanup); bare --csv writes "
                          "<output basename>.csv")
     ap.add_argument("--engines", default="duckduckgo,bing",
                     help="comma list: duckduckgo,bing,google (default ddg,bing)")
@@ -434,21 +448,15 @@ def main() -> None:
         import csv
         cfile = (args.csv if args.csv != "<auto>"
                  else args.output.rsplit(".", 1)[0] + ".csv")
-        header = ["first", "last", "name", "source_title"]
-        if args.format:
-            header.append("email")
+        # No header, one full name chunk per row (middle names / post-nominals
+        # intact) so you can hand-fix single-letter surnames, strip
+        # professional titles, etc. before generating emails.
         with open(cfile, "w", encoding="utf-8", newline="") as fh:
             w = csv.writer(fh)
-            w.writerow(header)
             for n in names:
-                toks = n.split()
-                first, last = toks[0], toks[-1]
-                row = [first, last, n, sc.found[n]]
-                if args.format:
-                    row.append(fmt_name(first, last, args.format))
-                w.writerow(row)
-        print(f"[+] {len(names)} rows -> {cfile}  (review/fix, then regenerate "
-              "emails from the corrected 'first'/'last' columns)")
+                w.writerow([sc.chunks.get(n, n)])
+        print(f"[+] {len(names)} rows -> {cfile}  (no header; one name per row, "
+              "full chunk - clean it up by hand)")
 
     if args.format:
         emails, seen = [], set()
