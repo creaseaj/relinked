@@ -101,13 +101,15 @@ POSSESSIVE = re.compile(r"[’']s\s+profile.*$", re.IGNORECASE)
 class Scraper:
     def __init__(self, timeout: int, jitter: float, proxy: str | None,
                  safe: bool, company: str, browser: bool = False,
-                 user_data_dir: str | None = None):
+                 user_data_dir: str | None = None,
+                 regions: list[str] | None = None):
         self.timeout = timeout
         self.jitter = jitter
         self.safe = safe
         self.company = company.lower()
         self.browser = browser
         self.user_data_dir = user_data_dir
+        self.regions = regions or []
         self.session = requests.Session()
         if proxy:
             self.session.proxies.update({"http": proxy, "https": proxy})
@@ -194,6 +196,14 @@ class Scraper:
             self._sleep()
 
     def bing(self, depth: int) -> None:
+        if self.browser:
+            return self._bing_browser(depth)
+        # Plain HTTP: a cold, cookieless session gets bot-flagged - Bing serves
+        # a frozen page 1 (its Next link stays at first=11) or unrelated junk.
+        # Priming the homepage helps page 1, but real pagination needs the
+        # cookied browser session (--browser / _bing_browser).
+        self._get("https://www.bing.com/")
+        self._sleep()
         q = quote_plus(f'site:linkedin.com/in "{self.company}"')
         for page in range(depth):
             first = page * 10 + 1
@@ -201,14 +211,119 @@ class Scraper:
             html = self._get(url)
             if not html:
                 break
-            soup = BeautifulSoup(html, "html.parser")
-            hits = soup.select("li.b_algo h2 a") or soup.select("h2 a")
-            if not hits:
-                break
-            for a in hits:
-                self._handle_title(a.get_text())
+            before = len(self.found)
+            self._harvest_bing(BeautifulSoup(html, "html.parser"))
             print(f"    [bing] page {page + 1}: {len(self.found)} names so far")
+            if len(self.found) == before:
+                break  # HTTP pagination doesn't advance; stop on no-new
             self._sleep()
+
+    def _bing_browser(self, depth: int) -> None:
+        # Drive Bing through the persistent, cookied Chrome profile and click
+        # its real Next link, like a person. A cookieless automated session
+        # gets bot-flagged (frozen page 1 / junk); an established profile
+        # paginates normally.
+        from selenium.webdriver.common.by import By
+        driver = self._get_driver()
+        q = quote_plus(f'site:linkedin.com/in "{self.company}"')
+        driver.get(f"https://www.bing.com/search?q={q}")
+        self._sleep()
+        try:
+            self._bing_pages(driver, By, depth)
+        except Exception as exc:
+            import traceback
+            print(f"    [!] Bing browser error: {exc}", file=sys.stderr)
+            traceback.print_exc()
+
+    def _bing_pages(self, driver, By, depth: int) -> None:
+        for page in range(depth):
+            soup = BeautifulSoup(driver.page_source, "html.parser")
+            before = len(self.found)
+            self._harvest_bing(soup)
+            print(f"    [bing] page {page + 1}: {len(self.found)} names so far "
+                  f"(url first={self._first_param(driver.current_url)})")
+            if page > 0 and len(self.found) == before:
+                break  # a real page that adds nothing new -> end of results
+            if page == depth - 1:
+                break
+            # Scroll to the bottom first - Bing lazy-renders the pager, and a
+            # Next link that isn't in view clicks unreliably.
+            driver.execute_script(
+                "window.scrollTo(0, document.body.scrollHeight);")
+            self._sleep()
+            try:
+                nxt = driver.find_element(By.CSS_SELECTOR, "a.sb_pagN")
+            except Exception:
+                break  # no Next link -> last page
+            next_href = nxt.get_attribute("href")
+            print(f"    [bing] -> Next link first={self._first_param(next_href or '')}",
+                  file=sys.stderr)
+            # Signature of the current page so we can wait for it to actually
+            # change after navigating (a short sleep can read the stale page).
+            sig = self._bing_sig(driver)
+            clicked = False
+            try:
+                driver.execute_script(
+                    "arguments[0].scrollIntoView({block:'center'});", nxt)
+                self._sleep()
+                nxt.click()
+                clicked = True
+            except Exception as exc:
+                print(f"    [!] click failed ({exc}); trying link directly.",
+                      file=sys.stderr)
+            advanced = self._wait_change(driver, sig) if clicked else False
+            if not advanced and next_href:
+                # Click didn't advance - navigate the Next link's URL directly.
+                print("    [bing] click didn't advance; opening Next URL direct",
+                      file=sys.stderr)
+                driver.get(next_href)
+                advanced = self._wait_change(driver, sig)
+            if not advanced:
+                print("    [i] Bing served the same page again (pagination "
+                      "capped for this session) - stopping.", file=sys.stderr)
+                break
+
+    @staticmethod
+    def _first_param(url: str) -> str:
+        from urllib.parse import urlparse, parse_qs
+        return (parse_qs(urlparse(url).query).get("first") or ["1"])[0]
+
+    @staticmethod
+    def _bing_sig(driver) -> str:
+        """First result title + current first= param - changes when the page
+        genuinely advances."""
+        soup = BeautifulSoup(driver.page_source, "html.parser")
+        h2 = soup.select_one("li.b_algo h2")
+        return (Scraper._first_param(driver.current_url) + "|" +
+                (h2.get_text()[:60] if h2 else ""))
+
+    def _wait_change(self, driver, old_sig: str, timeout: float = 10.0) -> bool:
+        """Poll until the results page differs from old_sig. False = unchanged
+        within timeout (Bing re-served the same page)."""
+        waited = 0.0
+        while waited < timeout:
+            time.sleep(0.5)
+            waited += 0.5
+            if self._bing_sig(driver) != old_sig:
+                return True
+        return False
+
+    def _harvest_bing(self, soup: BeautifulSoup) -> int:
+        """Keep only linkedin.com /in profiles (identified by each result's
+        visible <cite> domain, since Bing cloaks the href) and harvest the
+        <h2> title. Returns names added."""
+        before = len(self.found)
+        for li in soup.select("li.b_algo"):
+            cite = li.find("cite")
+            low = cite.get_text().lower() if cite else ""
+            if "linkedin.com" not in low:
+                continue
+            if "company" in low or "jobs" in low:  # skip non-profile pages
+                continue
+            h2 = li.find("h2")
+            if h2:
+                self._handle_title(h2.get_text(), known_linkedin=True)
+        return len(self.found) - before
 
     def google(self, depth: int) -> None:
         if self.browser:
@@ -244,12 +359,25 @@ class Scraper:
         opts = Options()
         # Visible on purpose - a headless window gives you nothing to click.
         opts.add_argument("--window-size=1200,900")
+        # Look like an ordinary browser, not automation. Search engines (Bing
+        # especially) detect Selenium via navigator.webdriver and the
+        # AutomationControlled flag and freeze on page 1 / serve junk; these
+        # flags plus the CDP patch below remove those tells.
+        opts.add_argument("--disable-blink-features=AutomationControlled")
         opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+        opts.add_experimental_option("useAutomationExtension", False)
         opts.add_argument(f"--user-agent={random.choice(USER_AGENTS)}")
         # Persist cookies/consent so you clear Google's wall ONCE, not per run.
         if self.user_data_dir:
             opts.add_argument(f"--user-data-dir={self.user_data_dir}")
         self._driver = webdriver.Chrome(options=opts)
+        try:
+            self._driver.execute_cdp_cmd(
+                "Page.addScriptToEvaluateOnNewDocument",
+                {"source": "Object.defineProperty(navigator, 'webdriver', "
+                           "{get: () => undefined});"})
+        except Exception:
+            pass  # non-Chrome driver / unsupported - best effort only
         return self._driver
 
     @staticmethod
@@ -289,15 +417,30 @@ class Scraper:
             self._sleep()
         return True
 
+    def _google_queries(self) -> list[str]:
+        """Query variants to run. A single site:linkedin.com/in query exhausts
+        at ~one page because Google only indexes a slice of profiles for that
+        exact phrasing; varying the phrasing and the regional LinkedIn
+        subdomain surfaces different people, so we run several and aggregate."""
+        c = self.company
+        qs = [f'site:linkedin.com/in "{c}"',
+              f'site:linkedin.com/in "at {c}"']
+        for r in self.regions:
+            qs.append(f'site:{r}.linkedin.com/in "{c}"')
+        return qs
+
     def _google_browser(self, depth: int) -> None:
+        driver = self._get_driver()
+        for query in self._google_queries():
+            print(f"    [google] query: {query}")
+            self._google_one_query(driver, query, depth)
+
+    def _google_one_query(self, driver, query: str, depth: int) -> None:
         from selenium.webdriver.common.by import By
         from selenium.webdriver.common.keys import Keys
 
-        driver = self._get_driver()
-        query = f'site:linkedin.com/in "{self.company}"'
-
         # Type the query into Google's search box rather than loading a
-        # ?q=... URL directly: a direct URL load sometimes lands on Google's
+        # ?q=... URL directly: a direct URL load lands on Google's
         # operator-relaxed results path (site: effectively ignored), whereas
         # submitting through the box is the normal flow and honours operators.
         driver.get("https://www.google.com/")
@@ -319,44 +462,92 @@ class Scraper:
         if not self._clear_wall(driver):
             return
 
-        # Page 1 is whatever the box submission landed on; later pages reuse
-        # that exact results URL (operators intact) with an added &start=.
-        base_url = driver.current_url
+        # Walk pages by clicking Google's own "Next" link, the way a person
+        # would. Google still tends to quietly drop the site: operator once it
+        # runs low on exact matches, so we don't rely on it: _harvest_linkedin
+        # enforces site: ourselves (only results labelled LinkedIn are kept),
+        # and once a page has no LinkedIn results left we move to the next
+        # query - the indexed profiles for this one are exhausted.
         for page in range(depth):
-            if page > 0:
-                page_url = self._with_start(base_url, page * 10)
-                driver.get(page_url)
-                self._sleep()
-                if not self._clear_wall(driver, reload_url=page_url):
-                    return
             soup = BeautifulSoup(driver.page_source, "html.parser")
-            n = self._harvest_linkedin(soup)
-            if n == 0 and not soup.select("h3"):
+            kept = self._harvest_linkedin(soup)
+            if kept == 0:
+                if not (page == 0 and not soup.select("h3")):
+                    print("    [i] no more LinkedIn results for this query "
+                          "(exhausted / relaxed).")
                 break
-            print(f"    [google] page {page + 1}: {len(self.found)} names so far")
+            print(f"    [google]   page {page + 1}: {len(self.found)} names so far")
+            if page == depth - 1:
+                break
+            if not self._click_next(driver):
+                break  # no further pages
 
-    @staticmethod
-    def _with_start(url: str, start: int) -> str:
-        """Return `url` with its start= pagination param set to `start`."""
-        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
-        parts = urlparse(url)
-        qs = parse_qs(parts.query, keep_blank_values=True)
-        qs["start"] = [str(start)]
-        return urlunparse(parts._replace(query=urlencode(qs, doseq=True)))
+    def _click_next(self, driver) -> bool:
+        """Click Google's Next-page link like a human. False = no next page."""
+        from selenium.webdriver.common.by import By
+        nxt = None
+        for by, sel in ((By.ID, "pnnext"),
+                        (By.CSS_SELECTOR, 'a[aria-label="Next page"]'),
+                        (By.CSS_SELECTOR, "#pnnext, a#pnnext")):
+            try:
+                nxt = driver.find_element(by, sel)
+                break
+            except Exception:
+                continue
+        if nxt is None:
+            return False
+        try:
+            driver.execute_script(
+                "arguments[0].scrollIntoView({block:'center'});", nxt)
+            self._sleep()
+            nxt.click()
+            self._sleep()
+        except Exception as exc:
+            print(f"    [!] couldn't click Next ({exc}); stopping pagination.",
+                  file=sys.stderr)
+            return False
+        # A fresh page may re-trigger the wall.
+        return self._clear_wall(driver)
 
     # Harvest names from result titles. We can't filter by the result URL:
     # Google now cloaks every hit behind an opaque /goto?url=<token> link with
     # no readable destination, so there's no linkedin.com/in/ string to match.
-    # Instead we trust the site:linkedin.com/in operator in the query to
-    # constrain results, and pull every organic <h3> title - Google reserves
-    # <h3> for organic result headings, so these are the profile titles.
-    # known_linkedin=True because profile titles often omit the word
-    # "LinkedIn" (e.g. "Jane Doe - Director at Acme Corp").
+    # Google also drops the site: operator once it runs low on exact matches,
+    # so we can't trust the query alone either. Instead we enforce site:
+    # ourselves: each organic <h3> result carries a visible source label
+    # ("LinkedIn . Name . N followers") in its block, so we keep a title only
+    # when its own result block is labelled LinkedIn and skip relaxed filler.
+    # Returns the number of LinkedIn results seen on the page.
     def _harvest_linkedin(self, soup: BeautifulSoup) -> int:
-        before = len(self.found)
-        for h in soup.select("h3"):
-            self._handle_title(h.get_text(), known_linkedin=True)
-        return len(self.found) - before
+        kept = skipped = 0
+        for h3 in soup.select("h3"):
+            if self._result_is_linkedin(h3):
+                self._handle_title(h3.get_text(), known_linkedin=True)
+                kept += 1
+            else:
+                skipped += 1
+        if skipped:
+            print(f"    [i] skipped {skipped} non-LinkedIn result(s) on this "
+                  "page (site: relaxed)", file=sys.stderr)
+        return kept
+
+    @staticmethod
+    def _result_is_linkedin(h3) -> bool:
+        """True if this result's own block is labelled LinkedIn. Climb
+        ancestors while the container still wraps only this one <h3>, looking
+        for a 'linkedin' source label. Stop as soon as a container holds
+        another <h3> - that's a multi-result block, so a label there would
+        belong to a neighbouring result, not this one."""
+        node = h3
+        for _ in range(8):
+            node = node.parent
+            if node is None:
+                break
+            if len(node.select("h3")) > 1:
+                break  # climbed into a block containing other results
+            if "linkedin" in node.get_text(" ", strip=True).lower():
+                return True
+        return False
 
     def close(self) -> None:
         if self._driver is not None:
@@ -392,8 +583,9 @@ def main() -> None:
                     help="also write a header-less CSV of one full name per row "
                          "(uncollapsed, for manual cleanup); bare --csv writes "
                          "<output basename>.csv")
-    ap.add_argument("--engines", default="duckduckgo,bing",
-                    help="comma list: duckduckgo,bing,google (default ddg,bing)")
+    ap.add_argument("--engines", default="google,bing",
+                    help="comma list: duckduckgo,bing,google (default google,bing; "
+                         "ddg is currently anti-bot-blocked)")
     ap.add_argument("--depth", type=int, default=5,
                     help="result pages per engine (default 5)")
     ap.add_argument("-j", "--jitter", type=float, default=1.5,
@@ -405,6 +597,10 @@ def main() -> None:
     ap.add_argument("--browser", action="store_true",
                     help="route Google through a visible Chrome so you can "
                          "solve CAPTCHAs/consent walls by hand (needs selenium)")
+    ap.add_argument("--regions", default="",
+                    help="comma list of regional LinkedIn subdomains to also "
+                         "query, e.g. au,uk,nz,sg - each surfaces different "
+                         "profiles (Google-browser engine only)")
     ap.add_argument("--user-data-dir",
                     default=os.path.expanduser("~/.relinked-chrome"),
                     help="persistent Chrome profile for --browser so Google's "
@@ -415,9 +611,11 @@ def main() -> None:
     args = ap.parse_args()
 
     print(f"[*] relinked - enumerating '{args.target}'")
+    regions = [r.strip().lower() for r in args.regions.split(",") if r.strip()]
     sc = Scraper(args.timeout, args.jitter, args.proxy, args.safe, args.target,
                  browser=args.browser,
-                 user_data_dir=(args.user_data_dir or None))
+                 user_data_dir=(args.user_data_dir or None),
+                 regions=regions)
 
     engine_map = {"duckduckgo": sc.duckduckgo, "bing": sc.bing, "google": sc.google}
     try:
