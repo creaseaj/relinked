@@ -3,9 +3,14 @@ names.txt
 *.csv
 *_emails.txt
 
-# Persistent Chrome profile for --browser
+# Persistent Chrome profile
 .relinked-chrome/
 
 # Python
 __pycache__/
 *.py[cod]
+
+# Go build output (the compiled binary; source lives in go/)
+/go/relinked
+/relinked
+*.tmp
