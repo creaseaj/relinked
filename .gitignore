@@ -13,4 +13,5 @@ __pycache__/
 # Go build output (the compiled binary; source lives in go/)
 /go/relinked
 /relinked
+/go/dist/
 *.tmp

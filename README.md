@@ -43,9 +43,17 @@ else installed — but it still drives a browser, so note:
 
 ## Go binary
 
+**Download:** prebuilt binaries for Linux, Windows and macOS (amd64/arm64) are
+attached to each [GitHub Release](../../releases) — grab the one for your
+platform, `chmod +x`, run. Nothing else to install but a Chromium and a
+display. Releases are produced by CI (`.github/workflows/release.yml`) when a
+version tag is pushed, e.g. `git tag v0.1.0 && git push origin v0.1.0`.
+
+**Or build it yourself:**
+
 ```sh
 cd go
-go build -o relinked .          # or: CGO_ENABLED=0 go build -ldflags="-s -w" -o relinked .
+go build -o relinked .          # or: CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o relinked .
 ./relinked -t "Target Company"
 ```
 
