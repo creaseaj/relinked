@@ -24,8 +24,8 @@ Intended for authorised security testing / OSINT only.
     python3 relinked.py -t "Target Company" -f '{first}.{last}@target.com'
     python3 relinked.py -t "Target Company" --csv -o names.txt
 
-Dependencies: selenium, beautifulsoup4
-    pip3 install selenium beautifulsoup4
+Dependencies: selenium, beautifulsoup4   (lxml optional, for faster parsing)
+    pip3 install selenium beautifulsoup4 lxml
 
 ------------------------------------------------------------------------
 HOW TO USE
@@ -38,10 +38,11 @@ HOW TO USE
      page through results - all by hand. Solve any CAPTCHA/consent wall
      yourself; relinked never touches it.
   3. That's it. As each results page loads, relinked harvests the names
-     automatically and prints a running total. Keep searching and paging
-     for as long as you like.
+     automatically, prints a running total, and writes them to the output
+     file live (so you can `tail -f names.txt`, and nothing is lost if the
+     browser or terminal dies). Keep searching and paging as long as you like.
   4. When you're done, press Ctrl+C in this terminal (or just close the
-     browser window). Names (and optional CSV / email list) are written out.
+     browser window). The CSV / email list (if requested) are written then.
 
 TROUBLESHOOTING
 
@@ -71,6 +72,15 @@ try:
     from bs4 import BeautifulSoup
 except ImportError:
     sys.exit("[-] Missing deps. Run: pip3 install selenium beautifulsoup4")
+
+# Parse result pages with lxml when it's installed (several times faster on
+# the large HTML a search results page produces) and fall back to the stdlib
+# parser otherwise, so lxml stays an optional speed-up, not a requirement.
+try:
+    import lxml  # noqa: F401
+    _PARSER = "lxml"
+except ImportError:
+    _PARSER = "html.parser"
 
 
 # Trailing site markers to strip from result titles, various locales/dashes.
@@ -193,7 +203,7 @@ class Harvester:
         """Harvest names from an already-read results page. Auto-detects
         Google vs Bing by URL; falls back to trying both. Returns the number
         of NEW names added."""
-        soup = BeautifulSoup(html, "html.parser")
+        soup = BeautifulSoup(html, _PARSER)
         host = urlparse(url).netloc.lower()
         before = len(self.found)
         if "bing." in host:
@@ -205,6 +215,20 @@ class Harvester:
             self._harvest_google(soup)
             self._harvest_bing(soup)
         return len(self.found) - before
+
+    def flush_names(self, path: str) -> None:
+        """Write the names gathered so far to `path`, atomically (write a temp
+        file then rename) so a crash or kill mid-session always leaves a
+        complete file. Called after every capture that adds names, so output
+        is never lost and you can tail it live."""
+        names = sorted(self.found)
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(names) + ("\n" if names else ""))
+            os.replace(tmp, path)
+        except OSError as exc:
+            print(f"    [!] couldn't write {path}: {exc}", file=sys.stderr)
 
     # -- title -> name -----------------------------------------------------
     def _handle_title(self, title: str, known_linkedin: bool = False) -> None:
@@ -290,11 +314,13 @@ def fmt_name(first: str, last: str, fmt: str) -> str:
     return out
 
 
-def watch_loop(h: Harvester, interval: float) -> None:
+def watch_loop(h: Harvester, interval: float, output: str) -> None:
     """Hand the browser to the user and watch it. Every `interval` seconds we
     read the current page from the DOM (a local read - no request is sent to
     the engine) and, whenever the page has changed, harvest names from it
-    automatically. You never touch this terminal until you're done."""
+    automatically. Names are flushed to `output` as they arrive so nothing is
+    lost if the session ends abruptly. You never touch this terminal until
+    you're done."""
     import time
     print("\n[*] Browser is open - just drive it. relinked is watching.")
     print("      - go to Google or Bing and run your own searches, e.g.")
@@ -324,6 +350,7 @@ def watch_loop(h: Harvester, interval: float) -> None:
                 if page is not None:
                     added = h.capture(*page)
                     if added:
+                        h.flush_names(output)  # crash-safe running output
                         print(f"    [+] {added} new name(s) -> "
                               f"{len(h.found)} total")
             time.sleep(interval)
@@ -337,8 +364,7 @@ def write_results(h: Harvester, args) -> None:
         print("[-] No names captured. Nothing written.", file=sys.stderr)
         return
 
-    with open(args.output, "w", encoding="utf-8") as fh:
-        fh.write("\n".join(names) + "\n")
+    h.flush_names(args.output)  # same writer the watch loop used
     print(f"\n[+] {len(names)} unique names -> {args.output}")
 
     if args.verbose:
@@ -394,10 +420,10 @@ def main() -> None:
                     help="persistent Chrome profile so a consent/robot wall "
                          "is remembered across runs "
                          "(default: ~/.relinked-chrome; pass '' to disable)")
-    ap.add_argument("--interval", type=float, default=1.5,
+    ap.add_argument("--interval", type=float, default=1.0,
                     help="seconds between page checks while watching "
-                         "(default 1.5; this only reads the DOM, it sends no "
-                         "requests to the engine)")
+                         "(default 1.0; each check is a tiny DOM read, it "
+                         "sends no requests to the engine)")
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="print captured names with their source titles")
     args = ap.parse_args()
@@ -407,7 +433,7 @@ def main() -> None:
                   user_data_dir=(args.user_data_dir or None))
     try:
         h.open_browser()
-        watch_loop(h, args.interval)
+        watch_loop(h, args.interval, args.output)
     finally:
         h.close()
 
