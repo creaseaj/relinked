@@ -73,13 +73,6 @@ except ImportError:
     sys.exit("[-] Missing deps. Run: pip3 install selenium beautifulsoup4")
 
 
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
-    "(KHTML, like Gecko) Version/17.4 Safari/605.1.15",
-]
-
 # Trailing site markers to strip from result titles, various locales/dashes.
 TITLE_TAIL = re.compile(r"\s*[\|\-–—]\s*LinkedIn.*$", re.IGNORECASE)
 NAME_SPLIT = re.compile(r"\s+[\-–—\|]\s+")      # " - ", " – ", " | "
@@ -89,7 +82,7 @@ POSSESSIVE = re.compile(r"[’']s\s+profile.*$", re.IGNORECASE)
 
 class Harvester:
     """Holds the browser and the accumulated names. Does no navigation -
-    only reads the page you have on screen when you ask it to."""
+    it only reads whatever page you have on screen and harvests names."""
 
     def __init__(self, company: str, safe: bool,
                  user_data_dir: str | None = None):
@@ -110,15 +103,18 @@ class Harvester:
         except ImportError:
             sys.exit("[-] relinked needs selenium: pip3 install selenium "
                      "(and a matching chromedriver on PATH)")
-        import random
         opts = Options()
         opts.add_argument("--window-size=1200,900")
-        # Mild anti-automation hygiene so the window behaves like an ordinary
-        # browser. You still do every bit of the navigating by hand.
+        # Hide the signs that this Chrome is Selenium-driven (the automation
+        # infobar, navigator.webdriver, the AutomationControlled flag) so it
+        # behaves like an ordinary browser you opened yourself. We deliberately
+        # do NOT override the User-Agent: a real, current Chrome already
+        # presents a UA that is consistent with its TLS/client-hint
+        # fingerprint, whereas a spoofed UA disagrees with them and is itself a
+        # bot tell.
         opts.add_argument("--disable-blink-features=AutomationControlled")
         opts.add_experimental_option("excludeSwitches", ["enable-automation"])
         opts.add_experimental_option("useAutomationExtension", False)
-        opts.add_argument(f"--user-agent={random.choice(USER_AGENTS)}")
         # Persistent profile: clear a consent/robot wall ONCE, not per run.
         if self.user_data_dir:
             opts.add_argument(f"--user-data-dir={self.user_data_dir}")
@@ -130,16 +126,20 @@ class Harvester:
                            "{get: () => undefined});"})
         except Exception:
             pass  # best effort only
-        # Land somewhere useful; you take it from here.
+        # Open a blank tab and stop there - YOU do every bit of the
+        # navigating, including the very first page load, so nothing automated
+        # ever hits a search engine.
         try:
-            self._driver.get("https://www.google.com/")
+            self._driver.get("about:blank")
         except Exception:
             pass
         return self._driver
 
     def window_closed(self) -> bool:
-        """True once the user has closed the browser window (no handles left
-        or the driver has gone away)."""
+        """True once the browser is gone: the user closed the last window (no
+        handles left) or the driver session has died (enumerating handles
+        raises). Only consulted after a probe has already failed, so an
+        exception here means the session really is unusable."""
         if self._driver is None:
             return True
         try:
@@ -154,18 +154,40 @@ class Harvester:
             except Exception:
                 pass
 
-    # -- capture the current page -----------------------------------------
+    # -- watching the current page ----------------------------------------
+    # A tiny JS probe: current URL plus the number of result headings on the
+    # page. It changes whenever you run a new search, turn a page (the URL's
+    # start=/first= param moves) or scroll in more results (the heading count
+    # grows). Returning this ~short string each tick is far cheaper than
+    # serialising the whole DOM, and it is a more reliable "did the page
+    # change" signal than the page's byte length (which jitters with ads and
+    # can collide between genuinely different pages).
+    _PROBE_JS = ("return location.href + '|' + "
+                 "document.querySelectorAll('h2,h3').length;")
+
+    def change_probe(self) -> str | None:
+        """Cheap change fingerprint read from the live DOM, or None if the
+        page can't be read (window closed / mid-navigation). Sends no request
+        to the engine."""
+        if self._driver is None:
+            return None
+        try:
+            return self._driver.execute_script(self._PROBE_JS)
+        except Exception:
+            return None
+
     def read_page(self) -> tuple[str, str] | None:
-        """Read the current URL + page HTML straight from the browser's DOM.
-        This is a local read - it issues no request to the search engine and
-        does not touch navigation. None = window gone / unreadable."""
+        """Read the current URL + full page HTML straight from the DOM. Only
+        called once the probe says the page changed, so the expensive
+        page_source pull happens per real page, not per tick. Still a local
+        read - no request reaches the engine."""
         if self._driver is None:
             return None
         try:
             return (self._driver.current_url or "",
                     self._driver.page_source or "")
         except Exception:
-            return None  # window closed, or navigation in progress
+            return None
 
     def capture(self, url: str, html: str) -> int:
         """Harvest names from an already-read results page. Auto-detects
@@ -183,13 +205,6 @@ class Harvester:
             self._harvest_google(soup)
             self._harvest_bing(soup)
         return len(self.found) - before
-
-    @staticmethod
-    def page_signature(url: str, html: str) -> str:
-        """A cheap fingerprint of the current results page. Changes when you
-        navigate or page, so the watcher only re-harvests on a real change
-        instead of every tick."""
-        return f"{url}|{len(html)}"
 
     # -- title -> name -----------------------------------------------------
     def _handle_title(self, title: str, known_linkedin: bool = False) -> None:
@@ -289,24 +304,28 @@ def watch_loop(h: Harvester, interval: float) -> None:
     print("    Stop when you're done: press Ctrl+C here, or just close the "
           "browser window.\n")
     last_sig = None
+    misses = 0  # consecutive failed probes; a transient mid-nav read is fine
     try:
         while True:
-            page = h.read_page()
-            if page is None:
-                # current_url can briefly fail mid-navigation; confirm the
-                # window is really gone before quitting.
-                if h.window_closed():
-                    print("    [i] browser window closed - wrapping up.")
+            sig = h.change_probe()
+            if sig is None:
+                # Probe failed. If the browser is genuinely gone, stop; a lone
+                # mid-navigation blip is not enough (require a short streak).
+                misses += 1
+                if h.window_closed() or misses >= 5:
+                    print("    [i] browser is gone - wrapping up.")
                     break
                 time.sleep(interval)
                 continue
-            url, html = page
-            sig = h.page_signature(url, html)
+            misses = 0
             if sig != last_sig:
                 last_sig = sig
-                added = h.capture(url, html)
-                if added:
-                    print(f"    [+] {added} new name(s) -> {len(h.found)} total")
+                page = h.read_page()
+                if page is not None:
+                    added = h.capture(*page)
+                    if added:
+                        print(f"    [+] {added} new name(s) -> "
+                              f"{len(h.found)} total")
             time.sleep(interval)
     except KeyboardInterrupt:
         print("\n    [i] stopped - wrapping up.")
