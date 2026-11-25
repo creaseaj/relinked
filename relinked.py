@@ -9,9 +9,11 @@ you have on screen - harvesting the public LinkedIn employee names it finds.
 You do all the driving yourself: open Google or Bing, type your own
 searches, page through the results, solve any consent/robot wall by hand.
 Because every query, click and scroll is a genuine human action, there is
-no automated-navigation fingerprint for the engines to flag. When a results
-page looks worth keeping, you switch back to this terminal and press Enter;
-relinked scrapes the names off the current page and adds them to the pile.
+no automated-navigation fingerprint for the engines to flag. relinked just
+watches: a few times a second it reads the page already loaded in the
+browser (a local DOM read - no request is sent to the engine) and, whenever
+the page changes, harvests the LinkedIn names off it automatically. You
+never have to touch the terminal while you work.
 
 No API keys, no credentials, no direct requests to LinkedIn, and - unlike
 the old version - no automated query submission or "Next" clicking.
@@ -35,12 +37,11 @@ HOW TO USE
      Vary the phrasing, add regional subdomains (au.linkedin.com, ...),
      page through results - all by hand. Solve any CAPTCHA/consent wall
      yourself; relinked never touches it.
-  3. When a results page is showing names you want, come back to this
-     terminal and press Enter. relinked reads the CURRENT page and reports
-     how many new names it harvested.
-  4. Repeat for as many pages/searches as you like.
-  5. Type  q  then Enter to finish. Names (and optional CSV / email list)
-     are written out.
+  3. That's it. As each results page loads, relinked harvests the names
+     automatically and prints a running total. Keep searching and paging
+     for as long as you like.
+  4. When you're done, press Ctrl+C in this terminal (or just close the
+     browser window). Names (and optional CSV / email list) are written out.
 
 TROUBLESHOOTING
 
@@ -49,8 +50,9 @@ TROUBLESHOOTING
     with a display, or use X-forwarding.
   chromedriver errors: install a chromedriver matching your Chrome, or just
     upgrade selenium (recent versions resolve the driver automatically).
-  "captured 0 names": make sure a Google or Bing *results* page is the
-    active tab when you press Enter - not the homepage, not LinkedIn itself.
+  "no names showing up": make sure you're on a Google or Bing *results*
+    page - not the homepage, and not LinkedIn itself. Only result pages from
+    those two engines are harvested.
   Names look wrong (titles, extra words): the parser keeps the first and
     last token of the name chunk; eyeball the output (or the --csv) and
     prune before generating emails. Re-run with -v to see source titles.
@@ -135,6 +137,16 @@ class Harvester:
             pass
         return self._driver
 
+    def window_closed(self) -> bool:
+        """True once the user has closed the browser window (no handles left
+        or the driver has gone away)."""
+        if self._driver is None:
+            return True
+        try:
+            return not self._driver.window_handles
+        except Exception:
+            return True
+
     def close(self) -> None:
         if self._driver is not None:
             try:
@@ -143,19 +155,22 @@ class Harvester:
                 pass
 
     # -- capture the current page -----------------------------------------
-    def capture(self) -> int:
-        """Read whatever results page is on screen and harvest names from it.
-        Auto-detects Google vs Bing by URL; falls back to trying both.
-        Returns the number of NEW names added."""
+    def read_page(self) -> tuple[str, str] | None:
+        """Read the current URL + page HTML straight from the browser's DOM.
+        This is a local read - it issues no request to the search engine and
+        does not touch navigation. None = window gone / unreadable."""
         if self._driver is None:
-            return 0
+            return None
         try:
-            url = self._driver.current_url or ""
-            html = self._driver.page_source or ""
-        except Exception as exc:
-            print(f"    [!] couldn't read the page ({exc}); is the window "
-                  "still open?", file=sys.stderr)
-            return 0
+            return (self._driver.current_url or "",
+                    self._driver.page_source or "")
+        except Exception:
+            return None  # window closed, or navigation in progress
+
+    def capture(self, url: str, html: str) -> int:
+        """Harvest names from an already-read results page. Auto-detects
+        Google vs Bing by URL; falls back to trying both. Returns the number
+        of NEW names added."""
         soup = BeautifulSoup(html, "html.parser")
         host = urlparse(url).netloc.lower()
         before = len(self.found)
@@ -168,6 +183,13 @@ class Harvester:
             self._harvest_google(soup)
             self._harvest_bing(soup)
         return len(self.found) - before
+
+    @staticmethod
+    def page_signature(url: str, html: str) -> str:
+        """A cheap fingerprint of the current results page. Changes when you
+        navigate or page, so the watcher only re-harvests on a real change
+        instead of every tick."""
+        return f"{url}|{len(html)}"
 
     # -- title -> name -----------------------------------------------------
     def _handle_title(self, title: str, known_linkedin: bool = False) -> None:
@@ -253,31 +275,41 @@ def fmt_name(first: str, last: str, fmt: str) -> str:
     return out
 
 
-def interactive_loop(h: Harvester) -> None:
-    """Hand the browser to the user; capture the current page each time they
-    press Enter; stop on q/quit/EOF."""
-    print("\n[*] Browser is open. Drive it yourself:")
+def watch_loop(h: Harvester, interval: float) -> None:
+    """Hand the browser to the user and watch it. Every `interval` seconds we
+    read the current page from the DOM (a local read - no request is sent to
+    the engine) and, whenever the page has changed, harvest names from it
+    automatically. You never touch this terminal until you're done."""
+    import time
+    print("\n[*] Browser is open - just drive it. relinked is watching.")
     print("      - go to Google or Bing and run your own searches, e.g.")
     print('          site:linkedin.com/in \"%s\"' % h.company)
     print("      - page through the results, solve any wall by hand")
-    print("    Then come back here and:")
-    print("      [Enter]  capture names from the page currently on screen")
-    print("      q+Enter  finish and write results\n")
-    while True:
-        try:
-            cmd = input("[relinked] Enter = capture, q = quit > ").strip().lower()
-        except EOFError:
-            print()
-            break
-        if cmd in ("q", "quit", "exit"):
-            break
-        added = h.capture()
-        if added:
-            print(f"    [+] captured {added} new name(s); "
-                  f"{len(h.found)} total")
-        else:
-            print(f"    [i] no new names on this page; {len(h.found)} total "
-                  "(is a Google/Bing results page the active tab?)")
+    print("    Names are captured automatically as pages load.")
+    print("    Stop when you're done: press Ctrl+C here, or just close the "
+          "browser window.\n")
+    last_sig = None
+    try:
+        while True:
+            page = h.read_page()
+            if page is None:
+                # current_url can briefly fail mid-navigation; confirm the
+                # window is really gone before quitting.
+                if h.window_closed():
+                    print("    [i] browser window closed - wrapping up.")
+                    break
+                time.sleep(interval)
+                continue
+            url, html = page
+            sig = h.page_signature(url, html)
+            if sig != last_sig:
+                last_sig = sig
+                added = h.capture(url, html)
+                if added:
+                    print(f"    [+] {added} new name(s) -> {len(h.found)} total")
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print("\n    [i] stopped - wrapping up.")
 
 
 def write_results(h: Harvester, args) -> None:
@@ -343,6 +375,10 @@ def main() -> None:
                     help="persistent Chrome profile so a consent/robot wall "
                          "is remembered across runs "
                          "(default: ~/.relinked-chrome; pass '' to disable)")
+    ap.add_argument("--interval", type=float, default=1.5,
+                    help="seconds between page checks while watching "
+                         "(default 1.5; this only reads the DOM, it sends no "
+                         "requests to the engine)")
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="print captured names with their source titles")
     args = ap.parse_args()
@@ -352,7 +388,7 @@ def main() -> None:
                   user_data_dir=(args.user_data_dir or None))
     try:
         h.open_browser()
-        interactive_loop(h)
+        watch_loop(h, args.interval)
     finally:
         h.close()
 
