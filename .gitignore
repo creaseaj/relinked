@@ -1,0 +1,11 @@
+# Scan output (contains real people's names — never commit)
+names.txt
+*.csv
+*_emails.txt
+
+# Persistent Chrome profile for --browser
+.relinked-chrome/
+
+# Python
+__pycache__/
+*.py[cod]
