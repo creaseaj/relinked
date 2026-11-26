@@ -20,21 +20,24 @@ you want to run it.
 
 | | `relinked.py` (Python) | `go/` (Go, single binary) |
 |---|---|---|
-| Install | `pip3 install selenium beautifulsoup4` (+ `lxml` optional, faster) and a chromedriver | none — one self-contained executable |
-| Drives Chrome via | Selenium / chromedriver | DevTools protocol (chromedp) directly |
-| Best when | you already have a Python/Selenium setup, or want to tweak the script | you want to hand someone a binary with nothing to install |
+| Install | `pip3 install selenium beautifulsoup4` (+ `lxml` optional, faster) and a driver | none — one self-contained executable |
+| Browser | **Chrome or Firefox** (`--firefox`), via Selenium | Chrome/Chromium only (DevTools protocol / chromedp) |
+| Best when | you already have a Python/Selenium setup, want Firefox, or want to tweak the script | you want to hand someone a binary with nothing to install |
 
-Both need a Chrome/Chromium on the machine and a display (the window is visible
-on purpose — you drive it).
+Both need a browser on the machine and a display (the window is visible on
+purpose — you drive it). Only the Python version can drive Firefox: chromedp
+speaks the Chrome DevTools protocol, which Firefox doesn't, so the Go binary is
+Chrome-only.
 
 ### Running on Kali
 
 The Go binary is statically linked, so it drops onto Kali and runs with nothing
 else installed — but it still drives a browser, so note:
 
-- **Install Chromium.** Kali ships Firefox ESR by default, and this tool can
-  only drive Chrome/Chromium: `sudo apt install chromium`. (Or point
-  `--chrome` at any Chrome/Chromium binary you have.)
+- **Browser.** The Go binary needs Chrome/Chromium, which Kali doesn't ship by
+  default: `sudo apt install chromium` (or point `--chrome` at a binary you
+  have). To use the **Firefox ESR that's already on Kali** instead, run the
+  Python version with `--firefox` — see [Python script](#python-script).
 - **Use a desktop session.** The window is visible and you drive it, so a GUI
   Kali is required — a headless/SSH/WSL Kali has no display and won't work.
 - **Root is handled.** Chrome won't run as root without `--no-sandbox`; relinked
@@ -81,6 +84,26 @@ pip3 install selenium beautifulsoup4 lxml
 python3 relinked.py -t "Target Company"
 python3 relinked.py -t "Target Company" -f '{first}.{last}@target.com' --csv
 ```
+
+### Firefox
+
+The Python version can drive Firefox instead of Chrome — handy on Kali, where
+Firefox ESR is already installed:
+
+```sh
+python3 relinked.py -t "Target Company" --firefox
+# reuse your existing Firefox cookies/logins (find the path at about:profiles;
+# close Firefox first). relinked copies the profile and drives the copy, so
+# your real profile is never touched or locked:
+python3 relinked.py -t "Target Company" --firefox \
+    --firefox-profile ~/.mozilla/firefox/xxxx.default-release
+# if the binary isn't auto-found (e.g. Kali's firefox-esr):
+python3 relinked.py -t "Target Company" --firefox-binary /usr/bin/firefox-esr
+```
+
+Firefox needs `geckodriver`; recent Selenium downloads it automatically. It
+can't attach to a Firefox window you already have open — it launches its own
+instance off the (copied) profile.
 
 ## How a session goes (either tool)
 
