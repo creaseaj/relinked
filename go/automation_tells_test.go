@@ -2,7 +2,8 @@
 
 // Checks what automation tells the chromedp-driven browser exposes to page
 // JavaScript - the things a site's anti-bot script could read. Mirrors the
-// flags/patch startBrowser() uses. Gated behind -tags smoke (needs Chrome):
+// flags startBrowser() uses (no JS webdriver override - the flag alone yields
+// the realistic value). Gated behind -tags smoke (needs Chrome):
 //
 //	go test -tags smoke -run TestAutomationTells -v
 package main
@@ -13,7 +14,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/chromedp/cdproto/page"
 	"github.com/chromedp/chromedp"
 )
 
@@ -22,10 +22,11 @@ func TestAutomationTells(t *testing.T) {
 	if _, err := os.Stat(chromeBin); err != nil {
 		t.Skip("no Chrome available")
 	}
+	// Same tell-suppression the real tool uses: the flag, and (deliberately)
+	// no JS webdriver override.
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.ExecPath(chromeBin),
 		chromedp.Flag("no-sandbox", true),
-		// Same tell-suppression the real tool uses:
 		chromedp.Flag("disable-blink-features", "AutomationControlled"),
 	)
 	allocCtx, cancelAlloc := chromedp.NewExecAllocator(context.Background(), opts...)
@@ -35,14 +36,10 @@ func TestAutomationTells(t *testing.T) {
 
 	var tells string
 	err := chromedp.Run(ctx,
-		chromedp.ActionFunc(func(ctx context.Context) error {
-			// The same webdriver override startBrowser installs.
-			_, err := page.AddScriptToEvaluateOnNewDocument(webdriverPatch).Do(ctx)
-			return err
-		}),
 		chromedp.Navigate("about:blank"),
 		chromedp.Evaluate(`JSON.stringify({
 			webdriver: String(navigator.webdriver),
+			present: ('webdriver' in navigator),
 			cdc: Object.getOwnPropertyNames(window).filter(n => n.toLowerCase().includes('cdc_')),
 			docCdc: Object.getOwnPropertyNames(document).filter(n => n.toLowerCase().includes('cdc_'))
 		})`, &tells),
@@ -51,13 +48,13 @@ func TestAutomationTells(t *testing.T) {
 		t.Fatalf("probe failed (Chrome launchable?): %v", err)
 	}
 	t.Logf("automation tells seen by the page: %s", tells)
-
-	// navigator.webdriver must not be true, and no chromedriver cdc_ vars.
 	if tells == "" {
 		t.Fatal("no result")
 	}
-	if strings.Contains(tells, `"webdriver":"true"`) {
-		t.Errorf("navigator.webdriver is true: %s", tells)
+	// Realistic, like a browser you opened yourself: webdriver present and
+	// false (NOT true, NOT undefined), and no chromedriver cdc_ variables.
+	if !strings.Contains(tells, `"webdriver":"false"`) {
+		t.Errorf("navigator.webdriver is not the realistic false: %s", tells)
 	}
 	if !strings.Contains(tells, `"cdc":[]`) || !strings.Contains(tells, `"docCdc":[]`) {
 		t.Errorf("cdc_ automation variables present: %s", tells)

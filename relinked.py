@@ -146,13 +146,14 @@ class Harvester:
         from selenium.webdriver.chrome.options import Options
         opts = Options()
         opts.add_argument("--window-size=1200,900")
-        # Hide the signs that this Chrome is Selenium-driven (the automation
-        # infobar, navigator.webdriver, the AutomationControlled flag) so it
-        # behaves like an ordinary browser you opened yourself. We deliberately
-        # do NOT override the User-Agent: a real, current Chrome already
-        # presents a UA that is consistent with its TLS/client-hint
-        # fingerprint, whereas a spoofed UA disagrees with them and is itself a
-        # bot tell.
+        # Make it behave like an ordinary Chrome you opened yourself. Removing
+        # the enable-automation switch drops both the "controlled by automated
+        # software" infobar AND the navigator.webdriver=true it would set; with
+        # AutomationControlled also disabled, navigator.webdriver reads the
+        # realistic FALSE (not undefined - forcing undefined is itself a tell,
+        # since a real browser returns false). We also don't spoof the
+        # User-Agent: a real Chrome's UA already matches its TLS/client-hint
+        # fingerprint, and a mismatched one is a bot tell.
         opts.add_argument("--disable-blink-features=AutomationControlled")
         opts.add_experimental_option("excludeSwitches", ["enable-automation"])
         opts.add_experimental_option("useAutomationExtension", False)
@@ -164,11 +165,17 @@ class Harvester:
         except Exception as exc:
             sys.exit(f"[-] couldn't launch Chrome: {exc}\n"
                      "    Install Chrome/Chromium, or use --firefox.")
+        # Best-effort: scrub the cdc_ properties chromedriver injects into the
+        # document (a well-known automation fingerprint). This is the one tell
+        # the Go build doesn't have - it drives Chrome over CDP directly, with
+        # no chromedriver - so for the cleanest footprint prefer the Go binary.
         try:
             self._driver.execute_cdp_cmd(
                 "Page.addScriptToEvaluateOnNewDocument",
-                {"source": "Object.defineProperty(navigator, 'webdriver', "
-                           "{get: () => undefined});"})
+                {"source":
+                 "for (const o of [window, document])"
+                 " for (const k of Object.getOwnPropertyNames(o))"
+                 "  if (k.includes('cdc_')) { try { delete o[k]; } catch (e) {} }"})
         except Exception:
             pass  # best effort only
 
@@ -180,9 +187,10 @@ class Harvester:
         opts.add_argument("--height=900")
         if self.firefox_binary:
             opts.binary_location = self.firefox_binary
-        # Best-effort: dampen the obvious automation tell. Modern Firefox may
-        # ignore this, but it matters little here - you do all the navigating
-        # and relinked only reads the page.
+        # Best-effort: ask Firefox not to advertise navigator.webdriver. Under
+        # Marionette (how Selenium drives Firefox) recent versions force it to
+        # true regardless, so unlike Chrome this tell often can't be hidden -
+        # if a clean navigator.webdriver matters, use Chrome or the Go binary.
         try:
             opts.set_preference("dom.webdriver.enabled", False)
             opts.set_preference("useAutomationExtension", False)

@@ -135,12 +135,42 @@ and keeps the **whole** name. Names come from result titles, so odd listings
 can still carry extra words — eyeball the output before use, and re-run with
 `-v`/`--verbose` to see each name next to the title it came from.
 
+## Detection footprint
+
+relinked's main defence is that **you** do all the navigating — the tool
+issues no requests and never clicks, so the behaviour, timing and network
+fingerprint are a real human's. It only reads the page. Beyond that, it keeps
+the browser from *announcing* that it's automated:
+
+| | `navigator.webdriver` | `cdc_` vars | automation infobar |
+|---|---|---|---|
+| **Go binary (Chrome)** | `false` (realistic) | none | none |
+| **Python + Chrome** | `false` (realistic) | best-effort scrub¹ | none |
+| **Python + Firefox** | often `true`² | none | none |
+
+¹ chromedriver injects `cdc_…` properties; relinked deletes them at
+document-start, but that's best-effort. The Go binary drives Chrome over the
+DevTools protocol with no chromedriver, so it never has them — **prefer the Go
+binary for the cleanest footprint.**
+² Under Marionette (how Selenium drives Firefox) recent versions force
+`navigator.webdriver = true` and ignore the pref that used to hide it.
+
+Verify your own setup: in the driven window's console run `navigator.webdriver`
+and `Object.getOwnPropertyNames(window).filter(n => n.includes('cdc_'))`, or
+load `bot.sannysoft.com`. The Go browser's footprint is covered by a
+regression test (`go test -tags smoke -run TestAutomationTells`).
+
+None of this is bulletproof — fingerprinting is an arms race — and it isn't a
+licence to hammer the engines; the human-in-the-loop design is what keeps it
+quiet.
+
 ## Developing
 
 The Go harvesting logic is browser-free and unit-tested:
 
 ```sh
 cd go
-go test ./...                               # fast, no browser
+go test ./...                                # fast, no browser
 go test -tags smoke -run TestBrowserPipeline # end-to-end against a headless Chrome
+go test -tags smoke -run TestAutomationTells # assert the browser leaks no common tells
 ```
