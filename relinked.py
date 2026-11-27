@@ -24,14 +24,23 @@ Intended for authorised security testing / OSINT only.
     python3 relinked.py -t "Target Company" -f '{first}.{last}@target.com'
     python3 relinked.py -t "Target Company" --csv -o names.txt
 
+    # Use Firefox instead of Chrome (e.g. the firefox-esr already on Kali),
+    # reusing a copy of your existing profile so its cookies come along:
+    python3 relinked.py -t "Target Company" --firefox \
+        --firefox-profile ~/.mozilla/firefox/xxxx.default-release
+
 Dependencies: selenium, beautifulsoup4   (lxml optional, for faster parsing)
     pip3 install selenium beautifulsoup4 lxml
+    Chrome needs a chromedriver; Firefox (--firefox) needs geckodriver - recent
+    selenium fetches both automatically.
 
 ------------------------------------------------------------------------
 HOW TO USE
 
-  1. Run it. A Chrome window opens (and stays open on its own profile, so
-     cookies/consent survive between runs).
+  1. Run it. A browser window opens - Chrome by default, or Firefox with
+     --firefox (and stays open on its own profile, so cookies/consent survive
+     between runs; or pass --firefox-profile to bring an existing profile's
+     cookies).
   2. In that window, go to Google or Bing and search however you like, e.g.
          site:linkedin.com/in "Target Company"
      Vary the phrasing, add regional subdomains (au.linkedin.com, ...),
@@ -95,48 +104,34 @@ class Harvester:
     """Holds the browser and the accumulated names. Does no navigation -
     it only reads whatever page you have on screen and harvests names."""
 
-    def __init__(self, company: str, safe: bool,
-                 user_data_dir: str | None = None):
+    def __init__(self, company: str, safe: bool, *,
+                 browser: str = "chrome",
+                 user_data_dir: str | None = None,
+                 firefox_profile: str | None = None,
+                 firefox_binary: str | None = None):
         self.company = company.lower()
         self.safe = safe
-        self.user_data_dir = user_data_dir
+        self.browser = browser               # "chrome" or "firefox"
+        self.user_data_dir = user_data_dir    # persistent profile for the engine
+        self.firefox_profile = firefox_profile  # existing profile to reuse (copy)
+        self.firefox_binary = firefox_binary
         # name -> title (first title seen)
         self.found: dict[str, str] = {}
         # name -> name again (kept so the CSV writer has a per-name value)
         self.chunks: dict[str, str] = {}
         self._driver = None
+        self._tmp_profile: str | None = None  # throwaway Firefox profile copy
 
     # -- browser -----------------------------------------------------------
     def open_browser(self):
         try:
-            from selenium import webdriver
-            from selenium.webdriver.chrome.options import Options
+            import selenium  # noqa: F401
         except ImportError:
-            sys.exit("[-] relinked needs selenium: pip3 install selenium "
-                     "(and a matching chromedriver on PATH)")
-        opts = Options()
-        opts.add_argument("--window-size=1200,900")
-        # Hide the signs that this Chrome is Selenium-driven (the automation
-        # infobar, navigator.webdriver, the AutomationControlled flag) so it
-        # behaves like an ordinary browser you opened yourself. We deliberately
-        # do NOT override the User-Agent: a real, current Chrome already
-        # presents a UA that is consistent with its TLS/client-hint
-        # fingerprint, whereas a spoofed UA disagrees with them and is itself a
-        # bot tell.
-        opts.add_argument("--disable-blink-features=AutomationControlled")
-        opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-        opts.add_experimental_option("useAutomationExtension", False)
-        # Persistent profile: clear a consent/robot wall ONCE, not per run.
-        if self.user_data_dir:
-            opts.add_argument(f"--user-data-dir={self.user_data_dir}")
-        self._driver = webdriver.Chrome(options=opts)
-        try:
-            self._driver.execute_cdp_cmd(
-                "Page.addScriptToEvaluateOnNewDocument",
-                {"source": "Object.defineProperty(navigator, 'webdriver', "
-                           "{get: () => undefined});"})
-        except Exception:
-            pass  # best effort only
+            sys.exit("[-] relinked needs selenium: pip3 install selenium")
+        if self.browser == "firefox":
+            self._open_firefox()
+        else:
+            self._open_chrome()
         # Open a blank tab and stop there - YOU do every bit of the
         # navigating, including the very first page load, so nothing automated
         # ever hits a search engine.
@@ -145,6 +140,107 @@ class Harvester:
         except Exception:
             pass
         return self._driver
+
+    def _open_chrome(self) -> None:
+        from selenium import webdriver
+        from selenium.webdriver.chrome.options import Options
+        opts = Options()
+        opts.add_argument("--window-size=1200,900")
+        # Make it behave like an ordinary Chrome you opened yourself. Removing
+        # the enable-automation switch drops both the "controlled by automated
+        # software" infobar AND the navigator.webdriver=true it would set; with
+        # AutomationControlled also disabled, navigator.webdriver reads the
+        # realistic FALSE (not undefined - forcing undefined is itself a tell,
+        # since a real browser returns false). We also don't spoof the
+        # User-Agent: a real Chrome's UA already matches its TLS/client-hint
+        # fingerprint, and a mismatched one is a bot tell.
+        opts.add_argument("--disable-blink-features=AutomationControlled")
+        opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+        opts.add_experimental_option("useAutomationExtension", False)
+        # Persistent profile: clear a consent/robot wall ONCE, not per run.
+        if self.user_data_dir:
+            opts.add_argument(f"--user-data-dir={self.user_data_dir}")
+        try:
+            self._driver = webdriver.Chrome(options=opts)
+        except Exception as exc:
+            sys.exit(f"[-] couldn't launch Chrome: {exc}\n"
+                     "    Install Chrome/Chromium, or use --firefox.")
+        # Best-effort: scrub the cdc_ properties chromedriver injects into the
+        # document (a well-known automation fingerprint). This is the one tell
+        # the Go build doesn't have - it drives Chrome over CDP directly, with
+        # no chromedriver - so for the cleanest footprint prefer the Go binary.
+        try:
+            self._driver.execute_cdp_cmd(
+                "Page.addScriptToEvaluateOnNewDocument",
+                {"source":
+                 "for (const o of [window, document])"
+                 " for (const k of Object.getOwnPropertyNames(o))"
+                 "  if (k.includes('cdc_')) { try { delete o[k]; } catch (e) {} }"})
+        except Exception:
+            pass  # best effort only
+
+    def _open_firefox(self) -> None:
+        from selenium import webdriver
+        from selenium.webdriver.firefox.options import Options
+        opts = Options()
+        opts.add_argument("--width=1200")
+        opts.add_argument("--height=900")
+        if self.firefox_binary:
+            opts.binary_location = self.firefox_binary
+        # Best-effort: ask Firefox not to advertise navigator.webdriver. Under
+        # Marionette (how Selenium drives Firefox) recent versions force it to
+        # true regardless, so unlike Chrome this tell often can't be hidden -
+        # if a clean navigator.webdriver matters, use Chrome or the Go binary.
+        try:
+            opts.set_preference("dom.webdriver.enabled", False)
+            opts.set_preference("useAutomationExtension", False)
+        except Exception:
+            pass
+        profile = self._firefox_profile_dir()
+        if profile:
+            opts.add_argument("-profile")
+            opts.add_argument(profile)
+        try:
+            self._driver = webdriver.Firefox(options=opts)
+        except Exception as exc:
+            sys.exit(f"[-] couldn't launch Firefox: {exc}\n"
+                     "    Install Firefox (on Kali it's firefox-esr; pass its\n"
+                     "    path with --firefox-binary) and geckodriver. Recent\n"
+                     "    selenium fetches geckodriver automatically.")
+
+    def _firefox_profile_dir(self) -> str | None:
+        """Decide which profile Firefox uses. With --firefox-profile we COPY
+        your existing profile to a throwaway dir and drive the copy, so its
+        cookies/logins come along but your real profile is never touched or
+        lock-contended. Without it, a persistent relinked profile so a
+        consent/robot wall is solved once, not per run."""
+        if self.firefox_profile:
+            import shutil
+            import tempfile
+            src = os.path.expanduser(self.firefox_profile)
+            if not os.path.isdir(src):
+                sys.exit(f"[-] --firefox-profile is not a directory: {src}\n"
+                         "    Find your profile path at about:profiles.")
+            parent = tempfile.mkdtemp(prefix="relinked-ff-")
+            dst = os.path.join(parent, "profile")
+            # Skip caches and lock files so the copy is small and not seen as
+            # "in use" (Firefox locks a live profile).
+            shutil.copytree(src, dst, ignore=shutil.ignore_patterns(
+                "cache2", "startupCache", "*.lock", "lock", ".parentlock",
+                "parent.lock"))
+            for lk in (".parentlock", "parent.lock", "lock"):
+                try:
+                    os.remove(os.path.join(dst, lk))
+                except OSError:
+                    pass
+            self._tmp_profile = parent
+            print("    [i] driving a copy of your Firefox profile (its cookies "
+                  "come along; your real profile is untouched)")
+            return dst
+        if self.user_data_dir:
+            os.makedirs(self.user_data_dir, exist_ok=True)
+            return self.user_data_dir
+        return None
 
     def window_closed(self) -> bool:
         """True once the browser is gone: the user closed the last window (no
@@ -164,6 +260,9 @@ class Harvester:
                 self._driver.quit()
             except Exception:
                 pass
+        if self._tmp_profile:  # throwaway Firefox profile copy
+            import shutil
+            shutil.rmtree(self._tmp_profile, ignore_errors=True)
 
     # -- watching the current page ----------------------------------------
     # A tiny JS probe: current URL plus the number of result headings on the
@@ -431,6 +530,17 @@ def main() -> None:
                     help="persistent Chrome profile so a consent/robot wall "
                          "is remembered across runs "
                          "(default: ~/.relinked-chrome; pass '' to disable)")
+    ap.add_argument("--firefox", action="store_true",
+                    help="drive Firefox (via geckodriver) instead of Chrome - "
+                         "e.g. to use the Firefox already on Kali")
+    ap.add_argument("--firefox-profile", metavar="DIR",
+                    help="reuse a COPY of this existing Firefox profile so its "
+                         "cookies/logins come along (find the path at "
+                         "about:profiles; close Firefox first so it's not a "
+                         "copy of a live profile). Implies --firefox")
+    ap.add_argument("--firefox-binary", metavar="PATH",
+                    help="path to the Firefox binary, e.g. /usr/bin/firefox-esr "
+                         "(default: auto-detect). Implies --firefox")
     ap.add_argument("--interval", type=float, default=1.0,
                     help="seconds between page checks while watching "
                          "(default 1.0; each check is a tiny DOM read, it "
@@ -439,9 +549,20 @@ def main() -> None:
                     help="print captured names with their source titles")
     args = ap.parse_args()
 
-    print(f"[*] relinked - harvesting names for '{args.target}'")
+    use_firefox = bool(args.firefox or args.firefox_profile or args.firefox_binary)
+    print(f"[*] relinked - harvesting names for '{args.target}' "
+          f"({'Firefox' if use_firefox else 'Chrome'})")
+    if use_firefox:
+        # Firefox gets its own persistent profile dir so it never clashes with
+        # the Chrome one; --firefox-profile overrides it with a reused copy.
+        persistent = os.path.expanduser("~/.relinked-firefox")
+    else:
+        persistent = (args.user_data_dir or None)
     h = Harvester(args.target, args.safe,
-                  user_data_dir=(args.user_data_dir or None))
+                  browser=("firefox" if use_firefox else "chrome"),
+                  user_data_dir=persistent,
+                  firefox_profile=args.firefox_profile,
+                  firefox_binary=args.firefox_binary)
     try:
         h.open_browser()
         watch_loop(h, args.interval, args.output)

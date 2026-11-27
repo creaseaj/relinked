@@ -34,7 +34,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/chromedp/cdproto/page"
 	"github.com/chromedp/chromedp"
 )
 
@@ -47,10 +46,6 @@ import (
 // genuinely different pages). It is an expression (not a statement) because
 // chromedp's Evaluate runs it through Runtime.evaluate.
 const probeJS = `location.href + '|' + document.querySelectorAll('h2,h3').length`
-
-// Hide that this Chrome is DevTools-driven, so navigator.webdriver reads
-// undefined the way it does in a browser you opened yourself.
-const webdriverPatch = `Object.defineProperty(navigator, 'webdriver', {get: () => undefined});`
 
 type config struct {
 	target      string
@@ -145,6 +140,10 @@ func main() {
 func startBrowser(c config) (context.Context, context.CancelFunc) {
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.Flag("headless", false), // visible on purpose - you drive it
+		// With this flag and no --enable-automation (chromedp doesn't pass it),
+		// navigator.webdriver reads false - exactly like a browser you opened
+		// yourself. We intentionally do NOT override it in JS: forcing it to
+		// undefined is itself a tell, since a real browser returns false.
 		chromedp.Flag("disable-blink-features", "AutomationControlled"),
 		chromedp.WindowSize(1200, 900),
 	)
@@ -171,16 +170,9 @@ func startBrowser(c config) (context.Context, context.CancelFunc) {
 	allocCtx, cancelAlloc := chromedp.NewExecAllocator(context.Background(), opts...)
 	ctx, cancelCtx := chromedp.NewContext(allocCtx)
 
-	// Start the browser, install the webdriver patch for every new document,
-	// and land on a blank tab - YOU make even the first real page load, so
-	// nothing automated ever hits a search engine.
-	err := chromedp.Run(ctx,
-		chromedp.ActionFunc(func(ctx context.Context) error {
-			_, err := page.AddScriptToEvaluateOnNewDocument(webdriverPatch).Do(ctx)
-			return err
-		}),
-		chromedp.Navigate("about:blank"),
-	)
+	// Start the browser and land on a blank tab - YOU make even the first real
+	// page load, so nothing automated ever hits a search engine.
+	err := chromedp.Run(ctx, chromedp.Navigate("about:blank"))
 	if err != nil {
 		cancelCtx()
 		cancelAlloc()

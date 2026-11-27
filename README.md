@@ -20,21 +20,24 @@ you want to run it.
 
 | | `relinked.py` (Python) | `go/` (Go, single binary) |
 |---|---|---|
-| Install | `pip3 install selenium beautifulsoup4` (+ `lxml` optional, faster) and a chromedriver | none — one self-contained executable |
-| Drives Chrome via | Selenium / chromedriver | DevTools protocol (chromedp) directly |
-| Best when | you already have a Python/Selenium setup, or want to tweak the script | you want to hand someone a binary with nothing to install |
+| Install | `pip3 install selenium beautifulsoup4` (+ `lxml` optional, faster) and a driver | none — one self-contained executable |
+| Browser | **Chrome or Firefox** (`--firefox`), via Selenium | Chrome/Chromium only (DevTools protocol / chromedp) |
+| Best when | you already have a Python/Selenium setup, want Firefox, or want to tweak the script | you want to hand someone a binary with nothing to install |
 
-Both need a Chrome/Chromium on the machine and a display (the window is visible
-on purpose — you drive it).
+Both need a browser on the machine and a display (the window is visible on
+purpose — you drive it). Only the Python version can drive Firefox: chromedp
+speaks the Chrome DevTools protocol, which Firefox doesn't, so the Go binary is
+Chrome-only.
 
 ### Running on Kali
 
 The Go binary is statically linked, so it drops onto Kali and runs with nothing
 else installed — but it still drives a browser, so note:
 
-- **Install Chromium.** Kali ships Firefox ESR by default, and this tool can
-  only drive Chrome/Chromium: `sudo apt install chromium`. (Or point
-  `--chrome` at any Chrome/Chromium binary you have.)
+- **Browser.** The Go binary needs Chrome/Chromium, which Kali doesn't ship by
+  default: `sudo apt install chromium` (or point `--chrome` at a binary you
+  have). To use the **Firefox ESR that's already on Kali** instead, run the
+  Python version with `--firefox` — see [Python script](#python-script).
 - **Use a desktop session.** The window is visible and you drive it, so a GUI
   Kali is required — a headless/SSH/WSL Kali has no display and won't work.
 - **Root is handled.** Chrome won't run as root without `--no-sandbox`; relinked
@@ -82,6 +85,26 @@ python3 relinked.py -t "Target Company"
 python3 relinked.py -t "Target Company" -f '{first}.{last}@target.com' --csv
 ```
 
+### Firefox
+
+The Python version can drive Firefox instead of Chrome — handy on Kali, where
+Firefox ESR is already installed:
+
+```sh
+python3 relinked.py -t "Target Company" --firefox
+# reuse your existing Firefox cookies/logins (find the path at about:profiles;
+# close Firefox first). relinked copies the profile and drives the copy, so
+# your real profile is never touched or locked:
+python3 relinked.py -t "Target Company" --firefox \
+    --firefox-profile ~/.mozilla/firefox/xxxx.default-release
+# if the binary isn't auto-found (e.g. Kali's firefox-esr):
+python3 relinked.py -t "Target Company" --firefox-binary /usr/bin/firefox-esr
+```
+
+Firefox needs `geckodriver`; recent Selenium downloads it automatically. It
+can't attach to a Firefox window you already have open — it launches its own
+instance off the (copied) profile.
+
 ## How a session goes (either tool)
 
 1. Run it; a Chrome window opens on a blank tab (its own persistent profile, so
@@ -112,12 +135,42 @@ and keeps the **whole** name. Names come from result titles, so odd listings
 can still carry extra words — eyeball the output before use, and re-run with
 `-v`/`--verbose` to see each name next to the title it came from.
 
+## Detection footprint
+
+relinked's main defence is that **you** do all the navigating — the tool
+issues no requests and never clicks, so the behaviour, timing and network
+fingerprint are a real human's. It only reads the page. Beyond that, it keeps
+the browser from *announcing* that it's automated:
+
+| | `navigator.webdriver` | `cdc_` vars | automation infobar |
+|---|---|---|---|
+| **Go binary (Chrome)** | `false` (realistic) | none | none |
+| **Python + Chrome** | `false` (realistic) | best-effort scrub¹ | none |
+| **Python + Firefox** | often `true`² | none | none |
+
+¹ chromedriver injects `cdc_…` properties; relinked deletes them at
+document-start, but that's best-effort. The Go binary drives Chrome over the
+DevTools protocol with no chromedriver, so it never has them — **prefer the Go
+binary for the cleanest footprint.**
+² Under Marionette (how Selenium drives Firefox) recent versions force
+`navigator.webdriver = true` and ignore the pref that used to hide it.
+
+Verify your own setup: in the driven window's console run `navigator.webdriver`
+and `Object.getOwnPropertyNames(window).filter(n => n.includes('cdc_'))`, or
+load `bot.sannysoft.com`. The Go browser's footprint is covered by a
+regression test (`go test -tags smoke -run TestAutomationTells`).
+
+None of this is bulletproof — fingerprinting is an arms race — and it isn't a
+licence to hammer the engines; the human-in-the-loop design is what keeps it
+quiet.
+
 ## Developing
 
 The Go harvesting logic is browser-free and unit-tested:
 
 ```sh
 cd go
-go test ./...                               # fast, no browser
+go test ./...                                # fast, no browser
 go test -tags smoke -run TestBrowserPipeline # end-to-end against a headless Chrome
+go test -tags smoke -run TestAutomationTells # assert the browser leaks no common tells
 ```
